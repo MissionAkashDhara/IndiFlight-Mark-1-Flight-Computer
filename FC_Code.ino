@@ -1,8 +1,9 @@
-/*
+/* version 1.2 - Added Bluetooth Functionality 
  * ============================================================
  *  ROCKET FLIGHT COMPUTER — Arduino Nano (ATmega328P)
  *  Hardware: BMP180 · MPU6050 · Winbond W25Q64 8MB SPI Flash
  *            Logic-level MOSFET · Buzzer · LED (Green/Red)
+ *            HC-05 Bluetooth · AMS1117-5V LDO regulator
  *
  *  State machine:
  *    BOOT → SELF_TEST → PAD_IDLE → BOOST → COAST
@@ -24,11 +25,14 @@
  *  Wiring summary:
  *    BMP180  : SDA→A4, SCL→A5
  *    MPU6050 : SDA→A4, SCL→A5  (shared I2C bus, addr 0x68)
- *    Flash   : CS→D10, MOSI→D11, MISO→D12, SCK→D13
- *    MOSFET  : Gate→D9  (via 100Ω resistor; 100µF on Vcc rail)
- *    Cont.   : D8 pull-up to Vcc through 10kΩ → pyro line sense
+ *    Flash   : CS→D10, MOSI→D11, MISO→D12, SCK→D13 (3.3V via Nano 3V3)
+ *    MOSFET  : Gate→D9  (via 100Ω resistor; 100µF/25V on drain rail)
+ *    Cont.   : D8 via 20kΩ/10kΩ voltage divider → pyro sense
  *    Buzzer  : D6 (active buzzer, active-HIGH)
  *    LED Grn : D5  LED Red : D4  (330Ω series resistor each)
+ *    HC-05   : TXD→D0(RX), RXD←1kΩ←D1(TX), VCC→5V, GND→GND
+ *              Disconnect HC-05 TXD from D0 before uploading firmware!
+ *    Power   : AMS1117-5V → Nano 5V pin (not Vin)
  * ============================================================
  */
 
@@ -63,6 +67,17 @@
 #define LANDING_CONFIRM_MS  10000    // 10 s stable window
 #define LOCATOR_PERIOD_MS   10000    // beep every 10 s after landing
 #define LOCATOR_BEEPS           3
+
+// ── Bluetooth telemetry ──────────────────────────────────────
+#define BT_BAUD            9600    // match HC-05 configured baud
+#define BT_TELEM_INTERVAL  1000   // ms between BT telemetry packets in idle
+// Bluetooth telemetry is active ONLY in ST_PAD_IDLE.
+// On launch detect it is silenced — Serial.end() frees D0/D1
+// but we simply stop writing; flash logging continues unaffected.
+#define BT_ENABLED         true    // set false to disable BT entirely
+
+// ── Red LED blink (continuity warn) ──────────────────────────
+#define RED_BLINK_MS       100     // 5 Hz fast blink = continuity open
 
 // ── Flash layout ─────────────────────────────────────────────
 // Session header: AA BB [session_id u8] [start_ms u32] [groundAlt f32]
@@ -155,6 +170,14 @@ uint32_t  buzzerNextMs   = 0;
 
 // Locator beep
 uint32_t  locatorNextMs  = 0;
+
+// Bluetooth
+uint32_t  btLastTelemMs  = 0;      // last BT telemetry packet sent
+bool      btActive       = false;  // true only while in PAD_IDLE
+
+// Red LED fast-blink (continuity warn)
+uint32_t  redBlinkMs     = 0;
+bool      redBlinkState  = false;
 
 // ── CRC-16/CCITT (fast table-less) ───────────────────────────
 uint16_t crc16Update(uint16_t crc, uint8_t b) {
@@ -444,6 +467,23 @@ void closeFlashSession() {
 void ledGreen(bool on) { digitalWrite(PIN_LED_GREEN, on ? HIGH : LOW); }
 void ledRed(bool on)   { digitalWrite(PIN_LED_RED,   on ? HIGH : LOW); }
 
+// ── Bluetooth telemetry packet ───────────────────────────────
+// Sends a compact CSV status line over Serial (D0/D1 → HC-05)
+// Format: BT,<ms>,<bmpAlt>,<temp>,<pres>,<roll>,<pitch>,<yaw>,<contOK>
+// Only called from ST_PAD_IDLE. Recording to flash is unaffected.
+void sendBTTelemetry() {
+  if (!BT_ENABLED) return;
+  Serial.print(F("BT,"));
+  Serial.print(millis());       Serial.print(',');
+  Serial.print(bmpAlt,   1);   Serial.print(',');
+  Serial.print(temperature, 1);Serial.print(',');
+  Serial.print(pressure_hPa,1);Serial.print(',');
+  Serial.print(roll,     1);   Serial.print(',');
+  Serial.print(pitch,    1);   Serial.print(',');
+  Serial.print(yaw,      1);   Serial.print(',');
+  Serial.println(continuityOK ? F("OK") : F("OPEN"));
+}
+
 // ── setup() ──────────────────────────────────────────────────
 void setup() {
   // Pins
@@ -591,9 +631,28 @@ void loop() {
       groundAlt = groundAlt * 0.99f +
                   (44330.0f * (1.0f - pow(pressure_hPa / 1013.25f, 0.1903f))) * 0.01f;
 
-      // Continuity status LED
+      // ── Green LED: solid = ready, off = not ready ─────────
       ledGreen(continuityOK);
-      ledRed(!continuityOK);
+
+      // ── Red LED: fast-blink at 5Hz if continuity open ─────
+      // Solid OFF when everything is fine
+      if (!continuityOK) {
+        if (now - redBlinkMs >= RED_BLINK_MS) {
+          redBlinkMs   = now;
+          redBlinkState = !redBlinkState;
+          ledRed(redBlinkState);
+        }
+      } else {
+        ledRed(false);
+        redBlinkState = false;
+      }
+
+      // ── Bluetooth telemetry — 1 Hz while on pad ───────────
+      if (BT_ENABLED && (now - btLastTelemMs >= BT_TELEM_INTERVAL)) {
+        btLastTelemMs = now;
+        sendBTTelemetry();
+        btActive = true;
+      }
 
       // Print pad status every 5 s to serial (every 125 ticks)
       static uint8_t padPrintCtr = 0;
@@ -614,6 +673,11 @@ void loop() {
 
       if (launchCtr >= LAUNCH_CONFIRM_TICKS) {
         // LAUNCH CONFIRMED
+        // ── Silence Bluetooth — D0/D1 must be free ────────
+        // We stop sending; Serial stays initialised for USB
+        // monitoring but BT packets cease immediately.
+        btActive = false;
+
         openFlashSession();
         logEvent(EVT_LAUNCH);
 
